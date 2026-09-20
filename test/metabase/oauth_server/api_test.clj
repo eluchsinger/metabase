@@ -950,7 +950,7 @@
           (is (=? {:error string?} response)))))))
 
 (deftest token-refresh-grant-test
-  (testing "Refresh token grant -- returns new access token"
+  (testing "Refresh rotates credentials, rejects reuse, and keeps the replacement usable"
     (mt/with-temporary-setting-values [site-url "http://localhost:3000"]
       (t2/with-transaction [_conn nil {:rollback-only true}]
         (let [test-client    (create-test-client!)
@@ -966,10 +966,61 @@
                                 {:grant_type    "refresh_token"
                                  :refresh_token (:refresh_token token-response)}
                                 :authorization (basic-auth-header client-id client-secret))]
-          (is (=? {:access_token string?
-                   :token_type   "Bearer"
-                   :expires_in   pos-int?}
-                  refresh-response)))))))
+          (is (=? {:access_token  string?
+                   :refresh_token string?
+                   :token_type    "Bearer"
+                   :expires_in    pos-int?}
+                  refresh-response))
+          (is (not= (:refresh_token token-response) (:refresh_token refresh-response)))
+          (is (= {:error "invalid_grant" :error_description invalid-token-request-description}
+                 (token-request! {:grant_type    "refresh_token"
+                                  :refresh_token (:refresh_token token-response)}
+                                 :expected-status 400
+                                 :authorization (basic-auth-header client-id client-secret))))
+          (is (=? {:access_token string? :refresh_token string?}
+                  (token-request! {:grant_type    "refresh_token"
+                                   :refresh_token (:refresh_token refresh-response)}
+                                  :authorization (basic-auth-header client-id client-secret)))))))))
+
+(deftest token-refresh-unknown-token-test
+  (testing "Unknown refresh tokens require reauthorization; missing parameters remain invalid requests (#80389)"
+    (mt/with-temporary-setting-values [site-url "http://localhost:3000"]
+      (t2/with-transaction [_conn nil {:rollback-only true}]
+        (doseq [public? [true false]]
+          (testing (if public? "public client" "confidential client")
+            (let [{:keys [client_id client_secret]}
+                  (create-test-client! (when public?
+                                         {:client_type                "public"
+                                          :client_secret_hash         nil
+                                          :token_endpoint_auth_method "none"}))
+                  authorization (when-not public? (basic-auth-header client_id client_secret))]
+              (doseq [[params error] [[{:refresh_token "unknown-refresh-token"} "invalid_grant"]
+                                      [{} "invalid_request"]]]
+                (is (= {:error error :error_description invalid-token-request-description}
+                       (token-request! (merge {:grant_type "refresh_token" :client_id client_id} params)
+                                       :expected-status 400
+                                       :authorization authorization)))))))))))
+
+(deftest token-refresh-expired-and-deleted-token-test
+  (testing "Expired refresh tokens return invalid_grant both before and after cleanup (#80389)"
+    (mt/with-temporary-setting-values [site-url "http://localhost:3000"]
+      (t2/with-transaction [_conn nil {:rollback-only true}]
+        (let [{:keys [client_id client_secret]} (create-test-client!)
+              authorization (basic-auth-header client_id client_secret)
+              tokens        (token-request! {:grant_type   "authorization_code"
+                                             :code         (authorize-and-get-code! client_id)
+                                             :redirect_uri "https://example.com/callback"}
+                                            :authorization authorization)]
+          (t2/update! :model/OAuthRefreshToken {:client_id client_id} {:expiry 1})
+          (doseq [deleted? [false true]]
+            (testing (if deleted? "after cleanup" "before cleanup")
+              (when deleted?
+                (t2/delete! :model/OAuthRefreshToken :client_id client_id))
+              (is (= {:error "invalid_grant" :error_description invalid-token-request-description}
+                     (token-request! {:grant_type    "refresh_token"
+                                      :refresh_token (:refresh_token tokens)}
+                                     :expected-status 400
+                                     :authorization authorization))))))))))
 
 (deftest refresh-token-has-expiry-test
   (testing "Refresh tokens are stored with an expiry derived from oauth-server-refresh-token-ttl"
@@ -1212,7 +1263,7 @@
                                  :authorization (basic-auth-header client_id client_secret)))))))))
 
 (deftest token-refresh-revoked-token-test
-  (testing "Refresh token grant with revoked refresh token returns error"
+  (testing "Revoked refresh tokens return invalid_grant so clients can reauthorize (#80389)"
     (mt/with-temporary-setting-values [site-url "http://localhost:3000"]
       (t2/with-transaction [_conn nil {:rollback-only true}]
         (let [test-client    (create-test-client!)
@@ -1234,7 +1285,8 @@
                            :refresh_token refresh-token}
                           :expected-status 400
                           :authorization (basic-auth-header client-id client-secret))]
-            (is (=? {:error string?} response))))))))
+            (is (= {:error "invalid_grant" :error_description invalid-token-request-description}
+                   response))))))))
 
 (deftest revocation-valid-token-test
   (testing "Revocation returns 200 for a valid access token"

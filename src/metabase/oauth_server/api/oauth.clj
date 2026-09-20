@@ -650,7 +650,9 @@
                 (catch ExceptionInfo e
                   (log/warnf "OAuth token request failed: %s" (ex-message e))
                   (let [data  (ex-data e)
-                        error (or (:error data) "invalid_request")]
+                        error (or (:error data)
+                                  (when (contains? data :refresh-token) "invalid_grant")
+                                  "invalid_request")]
                     {:status  (if (= error "invalid_client") 401 400)
                      :headers {"Content-Type"  "application/json"
                                "Cache-Control" "no-store"
